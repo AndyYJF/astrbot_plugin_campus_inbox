@@ -1,0 +1,9 @@
+name: astrbot_plugin_campus_inbox
+display_name: 校园消息收件箱
+desc: 主号采集白名单大学群消息，AI 汇总后经小号推送；支持待办候选确认与导出
+version: v0.1.0
+author: AndyYan
+repo: ""
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp

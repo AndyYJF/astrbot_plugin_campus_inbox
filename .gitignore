@@ -1,0 +1,19 @@
+# 内部工作文档与敏感信息（不进仓库）
+docs/
+findings.md
+progress.md
+task_plan.md
+check-docs.sh
+scripts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 数据与配置（含密钥）
+*.db
+*.db-shm
+*.db-wal
+*_config.json
+media/

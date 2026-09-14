@@ -1,0 +1,97 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "hint": "总开关。关闭时不采集、不处理、不推送。",
+    "type": "bool",
+    "default": false
+  },
+  "owner_qq": {
+    "description": "主人 QQ 号",
+    "hint": "唯一管理员的 QQ 号。只有它私聊小号才能执行管理命令。",
+    "type": "string",
+    "default": ""
+  },
+  "collector_platform_id": {
+    "description": "采集连接平台实例 ID",
+    "hint": "主号对应的 AstrBot 平台实例 ID（如 default）。该连接上除白名单群外的所有消息都会被静默忽略。",
+    "type": "string",
+    "default": ""
+  },
+  "collector_self_id": {
+    "description": "采集号 QQ（主号）",
+    "hint": "主号实际登录的 QQ 号。事件 self_id 与此不符时采集通道自动暂停。",
+    "type": "string",
+    "default": ""
+  },
+  "sender_platform_id": {
+    "description": "发送连接平台实例 ID",
+    "hint": "小号对应的 AstrBot 平台实例 ID。所有摘要和命令回复只从该连接发出。",
+    "type": "string",
+    "default": ""
+  },
+  "sender_self_id": {
+    "description": "发送号 QQ（小号）",
+    "hint": "小号实际登录的 QQ 号，必须与主号不同。事件 self_id 不符时发送通道自动暂停。",
+    "type": "string",
+    "default": ""
+  },
+  "subscriptions": {
+    "description": "初始订阅群列表",
+    "hint": "格式：群号:别名，每行一个。仅首次导入；运行后用 /校园 订阅、/校园 停订 命令管理。",
+    "type": "list",
+    "default": []
+  },
+  "digest_time": {
+    "description": "每日日报时间",
+    "hint": "格式 HH:MM，按业务时区。",
+    "type": "string",
+    "default": "21:30"
+  },
+  "external_ai_enabled": {
+    "description": "允许把群消息发送给外部 AI",
+    "hint": "默认关闭。关闭时采集与原文查询正常，AI 抽取功能暂停。",
+    "type": "bool",
+    "default": false
+  },
+  "external_ai_base_url": {
+    "description": "外部 AI 接口地址",
+    "hint": "OpenAI 兼容接口的 base URL，例如 http://host:8317/v1。external_ai_enabled=true 时必填。",
+    "type": "string",
+    "default": ""
+  },
+  "external_ai_api_key": {
+    "description": "外部 AI 密钥",
+    "hint": "只保存在 AstrBot 配置文件中，不会进入插件数据库。",
+    "type": "string",
+    "default": ""
+  },
+  "external_ai_model": {
+    "description": "外部 AI 模型名",
+    "hint": "调用 chat/completions 时使用的模型名。",
+    "type": "string",
+    "default": "gemini3.8flash"
+  },
+  "web_enabled": {
+    "description": "启用内嵌 Web 面板",
+    "hint": "只读面板，展示已抽取事项与溯源消息。",
+    "type": "bool",
+    "default": false
+  },
+  "web_port": {
+    "description": "Web 面板端口",
+    "hint": "容器内监听端口，需自行做端口映射/反代。",
+    "type": "int",
+    "default": 8620
+  },
+  "web_token": {
+    "description": "Web 面板访问令牌",
+    "hint": "必填，不填则面板拒绝所有请求。URL 加 ?token=xxx 访问。",
+    "type": "string",
+    "default": ""
+  },
+  "daily_call_limit": {
+    "description": "每日模型调用上限",
+    "type": "int",
+    "default": 200
+  }
+}
