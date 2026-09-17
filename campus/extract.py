@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 
 from .ai import ExternalAI, load_image_b64, parse_json_object
 from .storage import Storage
+
+logger = logging.getLogger("campus_inbox.extract")
 
 PROMPT_VERSION = "extract-v2"
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "extract.txt"
@@ -184,4 +187,42 @@ def run_extraction_cycle(
             storage.fail_batch(batch_id)
             return "failed"
     storage.finish_batch(batch_id)
+    if new_items:  # 同批次/相邻批次的重复事项：追加一次轻量去重
+        run_dedup(storage, ai)
     return "succeeded"
+
+
+_DEDUP_PROMPT = Path(__file__).parent.parent / "prompts" / "dedup.txt"
+
+
+def run_dedup(storage: Storage, ai: ExternalAI, limit: int = 50) -> int:
+    """对活跃事项做一次 AI 去重。返回合并掉的条数；任何失败都不影响主流程。"""
+    try:
+        rows = storage._conn.execute(
+            "SELECT item_id, title, category, time_text, updated_at FROM items "
+            "WHERE status IN ('active', 'needs_review') ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        if len(rows) < 2:
+            return 0
+        briefs = json.dumps([dict(r) for r in rows], ensure_ascii=False)
+        content = ai.chat(_DEDUP_PROMPT.read_text(encoding="utf-8"), briefs)
+        obj = parse_json_object(content)
+        merges = obj.get("merges") if isinstance(obj, dict) else None
+        if not isinstance(merges, list):
+            return 0
+        valid = {r["item_id"] for r in rows}
+        merged = 0
+        for group in merges:
+            if not isinstance(group, dict):
+                continue
+            keep, drops = group.get("keep"), group.get("drop")
+            if keep not in valid or not isinstance(drops, list):
+                continue
+            for d in drops:
+                if d in valid and d != keep and storage.absorb_item(keep, d):
+                    merged += 1
+        return merged
+    except Exception as e:
+        logger.warning("去重失败（不影响主流程）: %s", e)
+        return 0

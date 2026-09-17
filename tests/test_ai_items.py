@@ -313,3 +313,98 @@ class TestMerge(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def seq_ai(payloads: list) -> ExternalAI:
+    """按调用顺序依次返回不同 content 的假 AI。"""
+    it = iter(payloads)
+    return ExternalAI(
+        "http://fake/v1", "key", "gemini3.8flash",
+        transport=lambda url, headers, body, timeout: {
+            "choices": [{"message": {"content": next(it, '{"merges": []}')}}]
+        },
+    )
+
+
+class TestDedup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.storage = make_storage(self.tmp.name)
+
+    def tearDown(self):
+        self.storage.close()
+        self.tmp.cleanup()
+
+    def _make_item(self, title: str, remote_id: str) -> str:
+        key = add_message(self.storage, f"{title}的原文", remote_id)
+        items = validate_items({"items": [{
+            "title": title, "summary": "s", "category": "notice",
+            "source_refs": ["M1"]}]}, [key])
+        self.storage.create_batch("b-" + remote_id, [key], "m", PROMPT_VERSION)
+        self.storage.insert_items(items, "b-" + remote_id)
+        return items[0]["item"]["item_id"]
+
+    def test_absorb_item_transfers_and_withdraws(self):
+        keep = self._make_item("学生证填写与盖章通知", "r1")
+        drop = self._make_item("学生证信息填写及统一盖章通知", "r2")
+        self.assertTrue(self.storage.absorb_item(keep, drop))
+        detail = self.storage.get_item_detail(keep)
+        self.assertEqual(len(detail["sources"]), 2)
+        self.assertEqual(detail["revision"], 2)
+        self.assertEqual(self.storage.get_item_detail(drop)["status"], "withdrawn")
+        # 重复合并幂等
+        self.assertFalse(self.storage.absorb_item(keep, drop))
+
+    def test_run_dedup_merges_pair(self):
+        keep = self._make_item("学生证填写与盖章通知", "r1")
+        drop = self._make_item("学生证信息填写及统一盖章通知", "r2")
+        from campus.extract import run_dedup
+        ai = seq_ai([json.dumps({"merges": [{"keep": keep, "drop": [drop]}]},
+                                ensure_ascii=False)])
+        self.assertEqual(run_dedup(self.storage, ai), 1)
+        self.assertEqual(self.storage.get_item_detail(drop)["status"], "withdrawn")
+
+    def test_run_dedup_ignores_bogus(self):
+        keep = self._make_item("通知A", "r1")
+        self._make_item("通知B", "r2")
+        from campus.extract import run_dedup
+        ai = seq_ai(['{"merges": [{"keep": "不存在", "drop": ["也不存在"]}]}'])
+        self.assertEqual(run_dedup(self.storage, ai), 0)
+        self.assertEqual(self.storage.get_item_detail(keep)["status"], "active")
+
+    def test_run_dedup_needs_two_items(self):
+        self._make_item("只有一条", "r1")
+        from campus.extract import run_dedup
+        ai = seq_ai(["不该被调用"])
+        self.assertEqual(run_dedup(self.storage, ai), 0)
+
+    def test_cycle_auto_dedups_same_batch_duplicates(self):
+        """同批次两条相似通知 → 提取出两个事项 → 去重循环自动合并为一个。"""
+        k1 = add_message(self.storage, "请填写学生证信息，周五交到办公室", "r1")
+        k2 = add_message(self.storage, "学生证填写与统一盖章，周五前交办公室", "r2")
+        extract_resp = json.dumps({"items": [
+            {"title": "学生证填写与盖章通知", "summary": "周五前", "category": "notice",
+             "source_refs": ["M1"]},
+            {"title": "学生证信息填写及统一盖章通知", "summary": "周五前交", "category": "notice",
+             "source_refs": ["M2"]},
+        ]}, ensure_ascii=False)
+        storage = self.storage
+        # dedup 阶段 keep/drop 的 id 未知 → 用自定义 transport 动态生成
+        def dyn_transport(url, headers, body, timeout):
+            content = body["messages"][-1]["content"]
+            if isinstance(content, str) and '"item_id"' in content:
+                rows = storage._conn.execute(
+                    "SELECT item_id FROM items WHERE status='active' ORDER BY updated_at"
+                ).fetchall()
+                keep, drop = rows[0][0], rows[1][0]
+                return {"choices": [{"message": {"content": json.dumps(
+                    {"merges": [{"keep": keep, "drop": [drop]}]})}}]}
+            return {"choices": [{"message": {"content": extract_resp}}]}
+        ai = ExternalAI("http://fake/v1", "key", "m", transport=dyn_transport)
+        result = run_extraction_cycle(storage, ai, 80, 200)
+        self.assertEqual(result, "succeeded")
+        active = [r for r in storage._conn.execute(
+            "SELECT status FROM items").fetchall()]
+        self.assertEqual(len(active), 2)
+        statuses = sorted(r[0] for r in active)
+        self.assertEqual(statuses, ["active", "withdrawn"])

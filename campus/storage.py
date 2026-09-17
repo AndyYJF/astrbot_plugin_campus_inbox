@@ -381,6 +381,53 @@ class Storage:
         except sqlite3.Error as e:
             raise StorageError(f"事项合并失败: {e}") from e
 
+    def absorb_item(self, keep_id: str, drop_id: str) -> bool:
+        """事项级合并：drop 的来源全部转给 keep，drop 置为 withdrawn。两者都在才执行。"""
+        if keep_id == drop_id:
+            return False
+        try:
+            with self._lock, self._conn:
+                keep = self._conn.execute(
+                    "SELECT status FROM items WHERE item_id = ?", (keep_id,)
+                ).fetchone()
+                drop = self._conn.execute(
+                    "SELECT status FROM items WHERE item_id = ?", (drop_id,)
+                ).fetchone()
+                if keep is None or drop is None or drop["status"] == "withdrawn":
+                    return False
+                rows = self._conn.execute(
+                    "SELECT message_key, relation FROM item_sources WHERE item_id = ?",
+                    (drop_id,),
+                ).fetchall()
+                for r in rows:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO item_sources (item_id, message_key, relation) "
+                        "VALUES (?, ?, ?)",
+                        (keep_id, r["message_key"], r["relation"]),
+                    )
+                self._conn.execute(
+                    "DELETE FROM item_sources WHERE item_id = ?", (drop_id,)
+                )
+                now = _utcnow()
+                self._conn.execute(
+                    "UPDATE items SET revision = revision + 1, updated_at = ? "
+                    "WHERE item_id = ?",
+                    (now, keep_id),
+                )
+                self._conn.execute(
+                    "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
+                    "SELECT item_id, revision, json_object('absorbed', ?), ?, ? FROM items "
+                    "WHERE item_id = ?",
+                    (drop_id, f"并入重复事项 {drop_id}", now, keep_id),
+                )
+                self._conn.execute(
+                    "UPDATE items SET status = 'withdrawn', updated_at = ? WHERE item_id = ?",
+                    (now, drop_id),
+                )
+                return True
+        except sqlite3.Error:
+            return False
+
     def set_item_status(self, item_id: str, status: str, reason: str = "手动操作") -> bool:
         """更新事项状态（active/needs_review/withdrawn/done）并记 revision。"""
         if status not in ("active", "needs_review", "withdrawn", "done"):
