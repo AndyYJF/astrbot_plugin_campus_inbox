@@ -97,9 +97,12 @@ class TestAuth(WebTestBase):
         finally:
             server.stop()
 
-    def test_index_requires_token(self):
-        status, _ = self.get("/", token=None)
-        self.assertEqual(status, 401)
+    def test_index_shows_login_page_without_token(self):
+        # 无凭证访问首页返回登录页（200 HTML）；API 仍然 401
+        with _NO_PROXY.open(f"{self.base}/", timeout=5) as r:
+            body = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("登录", body)
 
 
 class TestApi(WebTestBase):

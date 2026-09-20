@@ -42,6 +42,7 @@ class NormalizedMessage:
     reply_unavailable: bool = False  # 存在引用但本地查不到原文
     parse_state: str = "text"  # text / media_unparsed / mixed
     weak_identity: bool = False
+    sender_role: str = ""  # owner / admin / member，官方通知识别用
 
 
 def build_message_key(

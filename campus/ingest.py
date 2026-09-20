@@ -29,6 +29,7 @@ class RawMessage(Protocol):
     source: SourceKey
     remote_id: str
     sender_alias: str
+    sender_role: str  # owner / admin / member，可为空
     sent_at: str  # UTC ISO 8601
     chain: Iterable  # AstrBot 消息链或测试用假段
 
@@ -132,6 +133,7 @@ def normalize(raw: RawMessage, reply_resolver: Callable[[SourceKey, str], str | 
         source=raw.source,
         remote_id=raw.remote_id,
         sender_alias=raw.sender_alias,
+        sender_role=getattr(raw, "sender_role", "") or "",
         sent_at=raw.sent_at,
         received_at=datetime.now(timezone.utc).isoformat(),
         text=text,

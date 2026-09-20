@@ -19,6 +19,7 @@ from .campus.config import Subscription, load_settings
 from .campus.digest import build_digest_text, local_now
 from .campus.extract import run_extraction_cycle
 from .campus.ingest import ingest, normalize, parse_group_recall, persist_media
+from .campus.jev import JevFilter
 from .campus.models import SourceKey
 from .campus.routing import Decision, route
 from .campus.storage import Storage
@@ -45,6 +46,9 @@ class _RawFromEvent:
         self.source = source
         self.remote_id = str(getattr(obj, "message_id", "") or "")
         self.sender_alias = event.get_sender_name() or str(event.get_sender_id())
+        raw_msg = getattr(obj, "raw_message", None)
+        sender = raw_msg.get("sender", {}) if isinstance(raw_msg, dict) else {}
+        self.sender_role = str(sender.get("role", "") or "")  # owner/admin/member
         ts = getattr(obj, "timestamp", 0) or 0
         self.sent_at = (
             datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
@@ -90,6 +94,22 @@ class CampusInbox(Star):
                 self.settings.external_ai_api_key,
                 self.settings.external_ai_model,
             )
+        # Jev 预过滤：只在提取通道可用时才装配（没提取就没有可省的调用）
+        self.jev: JevFilter | None = None
+        if (
+            self.ai is not None
+            and self.settings.jev_enabled
+            and "jev" not in self.settings.disabled_reasons
+        ):
+            self.jev = JevFilter(
+                self.settings.jev_api_key,
+                threshold=self.settings.jev_threshold,
+                base_url=self.settings.jev_base_url,
+                model=self.settings.jev_model,
+            )
+            logger.info(
+                "[campus_inbox] Jev 预过滤已启用，阈值 %s", self.jev.threshold
+            )
         self._digest_task: asyncio.Task | None = None
         self._dest_umo = (
             self.settings.destination_umo
@@ -109,6 +129,8 @@ class CampusInbox(Star):
                     self.storage, "0.0.0.0",
                     self.settings.web_port, self.settings.web_token,
                     media_dir=self.data_dir / "media",
+                    viewer_names=self.settings.viewer_names,
+                    viewer_admins=self.settings.viewer_admins,
                 )
                 self._panel.start()
                 logger.info("[campus_inbox] Web 面板监听端口 %s", self._panel.port)
@@ -134,6 +156,7 @@ class CampusInbox(Star):
                     self.ai,
                     self.settings.batch_new_message_limit,
                     self.settings.daily_call_limit,
+                    jev=self.jev,
                 )
                 if result not in ("skipped-empty",):
                     logger.info("[campus_inbox] 抽取批次结果: %s", result)
@@ -255,13 +278,15 @@ class CampusInbox(Star):
         if cmd.name == "status":
             stats = await asyncio.to_thread(self.storage.panel_stats)
             model = self.settings.external_ai_model if self.ai else "未启用"
+            jev_state = f"Jev 阈值{self.jev.threshold}" if self.jev else "Jev 关"
             groups = len([s for s in self._effective.subscriptions if s.enabled])
             yield event.plain_result(
                 "校园收件箱运行中\n"
                 f"订阅 {groups} 个群 · 消息 {stats['messages']} · 事项 {stats['items']}\n"
-                f"批次 成功{stats['batches_succeeded']}/失败{stats['batches_failed']} · "
+                f"批次 成功{stats['batches_succeeded']}/失败{stats['batches_failed']}"
+                f"/拦截{stats['batches_filtered']} · "
                 f"今日 AI {stats['batches_today']}/{self.settings.daily_call_limit}\n"
-                f"模型 {model} · 日报 {self.settings.digest_time}"
+                f"模型 {model} · {jev_state} · 日报 {self.settings.digest_time}"
             )
             return
 

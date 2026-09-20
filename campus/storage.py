@@ -87,8 +87,9 @@ class Storage:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO messages ("
                     "message_key, source_key, remote_id, sender_alias, sent_at, received_at,"
-                    " text, segments, media_json, reply_key, reply_unavailable, parse_state, weak_identity)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " text, segments, media_json, reply_key, reply_unavailable, parse_state, weak_identity,"
+                    " sender_role)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         msg.message_key,
                         msg.source.as_str(),
@@ -103,6 +104,7 @@ class Storage:
                         int(msg.reply_unavailable),
                         msg.parse_state,
                         int(msg.weak_identity),
+                        msg.sender_role,
                     ),
                 )
                 return "inserted" if cur.rowcount == 1 else "duplicate"
@@ -202,6 +204,26 @@ class Storage:
                 (batch_id,),
             )
 
+    def create_filtered_batch(
+        self, message_keys: list[str], prompt_version: str = "jev-prefilter-v1"
+    ) -> str:
+        """预过滤拦截的消息归档为 filtered 批次：不再被领入提取，不占当日模型额度。
+
+        filtered 是终态：不参与 pending/failed 的重试与自愈。
+        """
+        batch_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO extraction_batches "
+                "(batch_id, message_keys, state, attempts, next_attempt_at, lease_until, "
+                "model_ref, prompt_version, created_at) "
+                "VALUES (?, ?, 'filtered', 0, '', '', 'jev-prefilter', ?, ?)",
+                (batch_id, json.dumps(message_keys, ensure_ascii=False),
+                 prompt_version, now.isoformat()),
+            )
+        return batch_id
+
     def fail_batch(
         self, batch_id: str, max_attempts: int = 5, backoff_seconds: int = 300
     ) -> str:
@@ -281,11 +303,15 @@ class Storage:
             ).fetchall()
 
     def count_batches_today(self) -> int:
-        """今天（UTC）创建的批次数，用于 daily_call_limit。"""
+        """今天（UTC）创建的 LLM 提取批次数，用于 daily_call_limit。
+
+        filtered 批次不调模型，不计入额度。
+        """
         today = datetime.now(timezone.utc).date().isoformat()
         with self._lock:
             return self._conn.execute(
-                "SELECT COUNT(*) FROM extraction_batches WHERE created_at >= ?", (today,)
+                "SELECT COUNT(*) FROM extraction_batches "
+                "WHERE created_at >= ? AND state != 'filtered'", (today,)
             ).fetchone()[0]
 
     def insert_items(self, items: list[dict], batch_id: str) -> None:
@@ -668,7 +694,9 @@ class Storage:
         self, status: str = "", category: str = "", page: int = 1, per_page: int = 50
     ) -> tuple[list[sqlite3.Row], int]:
         where, params = "1=1", []
-        if status:
+        if status == "visible":
+            where += " AND status IN ('active', 'needs_review', 'done')"
+        elif status:
             where += " AND status = ?"
             params.append(status)
         if category:
@@ -725,6 +753,9 @@ class Storage:
                 ),
                 "batches_failed": q(
                     "SELECT COUNT(*) FROM extraction_batches WHERE state='failed'"
+                ),
+                "batches_filtered": q(
+                    "SELECT COUNT(*) FROM extraction_batches WHERE state='filtered'"
                 ),
                 "batches_today": self.count_batches_today(),
             }

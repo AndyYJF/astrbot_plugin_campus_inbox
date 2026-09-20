@@ -42,6 +42,8 @@
   #stats { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
   #stats b { color: var(--text-2); font-weight: 500; }
   .spacer { flex: 1; }
+  #logout { color: var(--muted, #888); font-size: 13px; text-decoration: none; padding: 4px 8px; border: 1px solid currentColor; border-radius: 6px; opacity: .7; }
+  #logout:hover { opacity: 1; }
   select {
     appearance: none; background: transparent; color: var(--text-2);
     border: 1px solid var(--line-strong); border-radius: 6px;
@@ -236,6 +238,7 @@
       <option value="discussion">讨论</option>
       <option value="uncertain">未分类</option>
     </select>
+    <a id="logout" href="/logout" style="display:none">退出</a>
   </div>
 </header>
 <main>
@@ -248,7 +251,21 @@
 const token = new URLSearchParams(location.search).get("token") ||
               sessionStorage.getItem("campus_token") || "";
 if (token) sessionStorage.setItem("campus_token", token);
+if (!token) document.getElementById("logout").style.display = "";  // cookie 会话才显示退出
 const q = () => `token=${encodeURIComponent(token)}`;
+// 角色：viewer 只读（同学），admin/full 可操作
+let ROLE = "viewer";
+const canEdit = () => ROLE !== "viewer";
+fetch(`/api/me?${q()}`).then(r => r.ok ? r.json() : null).then(d => {
+  if (d) ROLE = d.role;
+  if (ROLE === "viewer") {
+    // 同学视角：始终看全部事项（完成的也显示），隐藏状态筛选器
+    const fs = document.getElementById("f-status");
+    fs.value = "";
+    fs.style.display = "none";
+    loadItems();
+  }
+}).catch(() => {});
 const CAT = {notice:"通知",assignment:"作业",exam:"考试",registration:"报名",
              activity:"活动",resource:"资源",discussion:"讨论",uncertain:"未分类"};
 const fmtT = s => {
@@ -321,7 +338,7 @@ async function loadItems() {
         </div>
       </div>
       <div class="row-due${due.hot ? " hot" : ""}">${due.t}</div>
-      ${it.status !== "done" ? '<button class="ack" title="标为完成">✓</button>' : ""}`;
+      ${it.status !== "done" && canEdit() ? '<button class="ack" title="标为完成">✓</button>' : ""}`;
     div.querySelector(".row-title").textContent = it.title;
     if (it.summary) div.querySelector(".row-sub").textContent = it.summary;
     const ack = div.querySelector(".ack");
@@ -375,8 +392,8 @@ async function openDetail(id) {
       </dl>
     </div>
     <div class="d-actions">
-      ${d.status !== "done" ? '<button class="btn primary" data-act="done">标为完成</button>' : '<button class="btn" data-act="active">重新打开</button>'}
-      ${d.status !== "withdrawn" ? '<button class="btn danger" data-act="withdrawn">撤回</button>' : ""}
+      ${canEdit() ? (d.status !== "done" ? '<button class="btn primary" data-act="done">标为完成</button>' : '<button class="btn" data-act="active">重新打开</button>') : ""}
+      ${canEdit() && d.status !== "withdrawn" ? '<button class="btn danger" data-act="withdrawn">撤回</button>' : ""}
     </div>
     <div class="src-sec"><div class="sec-title">来源消息</div><div class="srcs"></div></div>`;
   el.querySelector("h2").textContent = d.title;

@@ -44,6 +44,8 @@ class Settings:
     web_enabled: bool = False
     web_port: int = 8620
     web_token: str = ""
+    viewer_names: tuple = ()
+    viewer_admins: tuple = ()
     batch_interval_seconds: int = 300
     batch_new_message_limit: int = 80
     context_message_limit: int = 20
@@ -54,7 +56,13 @@ class Settings:
     todo_mode: str = "export"
     todo_base_url: str = ""
     todo_token_env: str = "CAMPUS_TODO_TOKEN"
-    # 校验产生的通道关闭原因，键为通道名（collector/sender/ai/todo）
+    # Jev 预过滤：纯文本闲聊在送 LLM 提取前拦截（jev.py）
+    jev_enabled: bool = False
+    jev_api_key: str = ""
+    jev_base_url: str = "https://api.typesafe.ai"
+    jev_model: str = "jev-latest"
+    jev_threshold: float = 0.3
+    # 校验产生的通道关闭原因，键为通道名（collector/sender/ai/todo/jev）
     disabled_reasons: dict[str, str] = field(default_factory=dict)
 
 
@@ -96,6 +104,12 @@ def load_settings(cfg: dict) -> Settings:
         except (TypeError, ValueError):
             return default
 
+    def _f(key: str, default: float) -> float:
+        try:
+            return float(get(key, default))
+        except (TypeError, ValueError):
+            return default
+
     reasons: dict[str, str] = {}
 
     owner = _s("owner_qq")
@@ -129,6 +143,9 @@ def load_settings(cfg: dict) -> Settings:
     elif not _s("external_ai_base_url") or not _s("external_ai_api_key"):
         reasons["ai"] = "外部 AI 未配置完整（external_ai_base_url / external_ai_api_key）"
 
+    if _b("jev_enabled") and not _s("jev_api_key"):
+        reasons["jev"] = "jev_enabled=true 但未配置 jev_api_key，预过滤关闭"
+
     return Settings(
         enabled=_b("enabled"),
         owner_qq=owner,
@@ -149,6 +166,14 @@ def load_settings(cfg: dict) -> Settings:
         web_enabled=_b("web_enabled"),
         web_port=min(max(_i("web_port", 8620), 1024), 65535),
         web_token=_s("web_token"),
+        viewer_names=tuple(dict.fromkeys(
+            n.strip() for n in (get("viewer_names") or [])
+            if isinstance(n, str) and n.strip()
+        )),
+        viewer_admins=tuple(dict.fromkeys(
+            n.strip() for n in (get("viewer_admins") or [])
+            if isinstance(n, str) and n.strip()
+        )),
         batch_interval_seconds=max(_i("batch_interval_seconds", 300), 30),
         batch_new_message_limit=max(_i("batch_new_message_limit", 80), 1),
         context_message_limit=max(_i("context_message_limit", 20), 0),
@@ -159,5 +184,10 @@ def load_settings(cfg: dict) -> Settings:
         todo_mode=todo_mode,
         todo_base_url=_s("todo_base_url"),
         todo_token_env=_s("todo_token_env", "CAMPUS_TODO_TOKEN") or "CAMPUS_TODO_TOKEN",
+        jev_enabled=_b("jev_enabled"),
+        jev_api_key=_s("jev_api_key"),
+        jev_base_url=_s("jev_base_url", "https://api.typesafe.ai") or "https://api.typesafe.ai",
+        jev_model=_s("jev_model", "jev-latest") or "jev-latest",
+        jev_threshold=min(max(_f("jev_threshold", 0.3), 0.0), 1.0),
         disabled_reasons=reasons,
     )

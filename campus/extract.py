@@ -17,7 +17,7 @@ from .storage import Storage
 
 logger = logging.getLogger("campus_inbox.extract")
 
-PROMPT_VERSION = "extract-v2"
+PROMPT_VERSION = "extract-v4"  # v4: 成员的报名/征集类行动号召恢复提取
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "extract.txt"
 
 MAX_IMAGES_PER_MSG = 2
@@ -39,14 +39,19 @@ def load_system_prompt() -> str:
 
 
 def render_user_prompt(messages: list, active_items: list | None = None) -> str:
-    """messages: storage 行（sender_alias/sent_at/text）。返回编号化输入。
+    """messages: storage 行（sender_alias/sent_at/text/sender_role）。返回编号化输入。
 
     active_items: 进行中事项简报（item_id/title/category/due_date），编号为 E1..En。
     """
     lines = ["以下是需要分析的群消息：", ""]
     for i, m in enumerate(messages, 1):
         text = (m["text"] or "").strip() or "[无文本内容]"
-        lines.append(f"M{i} [{m['sent_at']}] {m['sender_alias']}: {text}")
+        try:
+            role_val = m["sender_role"] or ""
+        except (TypeError, KeyError):
+            role_val = getattr(m, "sender_role", "") or ""
+        role = {"owner": "群主", "admin": "管理员"}.get(role_val, "成员")
+        lines.append(f"M{i} [{m['sent_at']}] {m['sender_alias']}（{role}）: {text}")
     if active_items:
         lines += ["", "以下是已存在的进行中事项：", ""]
         for i, it in enumerate(active_items, 1):
@@ -134,10 +139,13 @@ def run_extraction_cycle(
     batch_new_message_limit: int,
     daily_call_limit: int,
     downloader=load_image_b64,
+    jev=None,
 ) -> str:
-    """单轮抽取。返回 skipped-limit / skipped-empty / succeeded / failed。
+    """单轮抽取。返回 skipped-limit / skipped-empty / filtered / succeeded / failed。
 
     失败不丢原文：批次回 pending（含退避），消息随下轮重新领入。
+    jev: 可选 JevFilter，领新批时先把纯文本闲聊归档为 filtered 批次，
+    只把值得的消息送给 LLM；含媒体消息与判定失败的消息一律放行。
     """
     storage.recover_expired_leases()
     storage.rearm_failed_batches()  # failed 冷却后自愈，API 恢复不需人工介入
@@ -158,6 +166,16 @@ def run_extraction_cycle(
         messages = storage.list_unbatched_messages(batch_new_message_limit)
         if not messages:
             return "skipped-empty"
+        if jev is not None:
+            messages, dropped = jev.split(messages)
+            if dropped:
+                storage.create_filtered_batch(
+                    [m["message_key"] for m in dropped],
+                    getattr(jev, "QUESTION_VERSION", "jev-prefilter-v1"),
+                )
+                logger.info("Jev 预过滤拦截 %s 条闲聊", len(dropped))
+            if not messages:
+                return "filtered"
         message_keys = [m["message_key"] for m in messages]
         batch_id = uuid.uuid4().hex
         storage.create_batch(batch_id, message_keys, ai.model, PROMPT_VERSION)

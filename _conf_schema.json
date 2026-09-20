@@ -71,6 +71,24 @@
     "type": "string",
     "default": "gemini3.8flash"
   },
+  "jev_enabled": {
+    "description": "启用 Jev 预过滤",
+    "hint": "用 TypeSafe Jev 模型把纯文本闲聊拦在 LLM 提取之外，省提取调用。含图片/文件的消息不受影响，判定失败一律放行，不会丢通知。",
+    "type": "bool",
+    "default": false
+  },
+  "jev_api_key": {
+    "description": "Jev API 密钥",
+    "hint": "TypeSafe console 申请。只保存在 AstrBot 配置文件中，不会进入插件数据库。",
+    "type": "string",
+    "default": ""
+  },
+  "jev_threshold": {
+    "description": "Jev 放行阈值",
+    "hint": "0~1 的小数，消息低于该分数视为闲聊被拦截。生产数据评测推荐 0.3（通知召回率 100%）。",
+    "type": "string",
+    "default": "0.3"
+  },
   "web_enabled": {
     "description": "启用内嵌 Web 面板",
     "hint": "只读面板，展示已抽取事项与溯源消息。",
@@ -88,6 +106,18 @@
     "hint": "必填，不填则面板拒绝所有请求。URL 加 ?token=xxx 访问。",
     "type": "string",
     "default": ""
+  },
+  "viewer_names": {
+    "description": "同学名单（只读访问）",
+    "hint": "允许输入姓名登录看面板的同学，每行一个名字。只能看，不能改状态。",
+    "type": "list",
+    "default": []
+  },
+  "viewer_admins": {
+    "description": "管理员名单",
+    "hint": "名单里的名字登录后可以标记完成/撤回。必须也在同学名单里。",
+    "type": "list",
+    "default": []
   },
   "daily_call_limit": {
     "description": "每日模型调用上限",
