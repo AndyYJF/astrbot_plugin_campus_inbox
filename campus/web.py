@@ -204,22 +204,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "bad body"}, 400)
             return
         mapping = {"open": "active", "completed": "done", "cancelled": "withdrawn"}
+        if not isinstance(body, dict):
+            self._send_json({"error": "bad body"}, 400)
+            return
         target = mapping.get(str(body.get("status") or ""))
         if target is None:
             self._send_json({"error": "bad status, 用 open/completed/cancelled"}, 400)
             return
-        storage = self.server.storage
-        current = storage.get_item_revision(task_id)
-        if current is None:
-            self._send_json({"error": "not found"}, 404)
-            return
         version = body.get("version")
-        if version is not None and int(version) != current:
-            self._send_json({"error": "version conflict", "current_revision": current}, 412)
+        if version is not None and type(version) is not int:
+            self._send_json({"error": "bad version"}, 400)
             return
-        storage.set_item_status(task_id, target, "Todo API 回写")
-        self._send_json({"ok": True, "task_id": task_id,
-                         "version": storage.get_item_revision(task_id)})
+        operation_id = body.get("operationId")
+        if operation_id is not None and (
+            not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 64
+        ):
+            self._send_json({"error": "bad operationId"}, 400)
+            return
+        code, result = self.server.storage.set_todo_status(task_id, target, version, operation_id)
+        self._send_json(result, code)
 
     # ---- 路由 ----
 

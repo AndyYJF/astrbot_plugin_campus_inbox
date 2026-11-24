@@ -104,6 +104,8 @@ class ExternalAI:
             "max_tokens": max_tokens,
             "temperature": 0.2,
         }
+        if "deepseek.com" in self.base_url:
+            payload["thinking"] = {"type": "disabled"}
         data = self._transport(
             f"{self.base_url}/chat/completions",
             {"Authorization": f"Bearer {self.api_key}"},

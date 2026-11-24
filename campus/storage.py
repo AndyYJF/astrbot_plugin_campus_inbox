@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import unicodedata
 from datetime import datetime, timedelta
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,14 @@ from pathlib import Path
 from .models import NormalizedMessage, SourceKey
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+
+def _identity_text(value: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _occurrence(item) -> tuple[str, str, str]:
+    return item["due_at"], item["due_date"], item["event_at"]
 
 
 class StorageError(Exception):
@@ -230,7 +239,7 @@ class Storage:
         """attempts+1；未超限回到 pending 并设退避，超限转 failed。返回新状态。"""
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT attempts FROM extraction_batches WHERE batch_id = ?", (batch_id,)
+                "SELECT attempts FROM extraction_batches WHERE batch_id = ? AND state = 'running'", (batch_id,)
             ).fetchone()
             if row is None:
                 return "missing"
@@ -315,46 +324,108 @@ class Storage:
             ).fetchone()[0]
 
     def insert_items(self, items: list[dict], batch_id: str) -> None:
-        """同事务写入 items + item_revisions + item_sources。
-
-        items 元素结构：{"item": {...列值...}, "sources": [message_key, ...]}。
-        """
-        now = _utcnow()
+        """批量写入事项及初始修订。生产抽取统一使用 commit_extraction。"""
         try:
             with self._lock, self._conn:
+                now = _utcnow()
                 for entry in items:
-                    it = entry["item"]
-                    self._conn.execute(
-                        "INSERT INTO items (item_id, revision, category, title, summary, "
-                        "audience, relevance, action_text, due_at, due_date, event_at, "
-                        "time_text, uncertain_fields, status, updated_at) "
-                        "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
-                        (
-                            it["item_id"], it["category"], it["title"], it["summary"],
-                            it["audience"], it["relevance"], it["action_text"],
-                            it["due_at"], it["due_date"], it["event_at"],
-                            it["time_text"], json.dumps(it["uncertain_fields"],
-                                                         ensure_ascii=False),
-                            _utcnow(),
-                        ),
-                    )
-                    snapshot = {k: v for k, v in it.items() if k != "item_id"}
-                    snapshot["item_id"] = it["item_id"]
-                    self._conn.execute(
-                        "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
-                        "VALUES (?, 1, ?, ?, ?)",
-                        (it["item_id"], json.dumps(snapshot, ensure_ascii=False),
-                         f"批次 {batch_id} 抽取", now),
-                    )
-                    for mk in entry["sources"]:
-                        self._conn.execute(
-                            "INSERT OR IGNORE INTO item_sources (item_id, message_key, relation) "
-                            "VALUES (?, ?, 'original')",
-                            (it["item_id"], mk),
-                        )
+                    self._insert_item(entry["item"], entry["sources"], batch_id, now)
         except sqlite3.Error as e:
             raise StorageError(f"事项写入失败: {e}") from e
 
+    def _insert_item(self, it: dict, sources: list[str], batch_id: str, now: str) -> None:
+        self._conn.execute(
+            "INSERT INTO items (item_id, revision, category, title, summary, "
+            "audience, relevance, action_text, due_at, due_date, event_at, "
+            "time_text, uncertain_fields, status, updated_at) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            (
+                it["item_id"], it["category"], it["title"], it["summary"],
+                it["audience"], it["relevance"], it["action_text"],
+                it["due_at"], it["due_date"], it["event_at"],
+                it["time_text"], json.dumps(it["uncertain_fields"],
+                                             ensure_ascii=False),
+                _utcnow(),
+            ),
+        )
+        snapshot = {k: v for k, v in it.items() if k != "item_id"}
+        snapshot["item_id"] = it["item_id"]
+        self._conn.execute(
+            "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
+            "VALUES (?, 1, ?, ?, ?)",
+            (it["item_id"], json.dumps(snapshot, ensure_ascii=False),
+             f"批次 {batch_id} 抽取", now),
+        )
+        for mk in sources:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO item_sources (item_id, message_key, relation) "
+                "VALUES (?, ?, 'original')",
+                (it["item_id"], mk),
+            )
+
+    def commit_extraction(self, batch_id: str, entries: list[dict]) -> bool:
+        """批次和事项一同提交。重放已完成的批次不会重新插入事项。"""
+        try:
+            with self._lock, self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                batch = self._conn.execute(
+                    "SELECT state FROM extraction_batches WHERE batch_id = ?", (batch_id,)
+                ).fetchone()
+                if batch is None or batch["state"] != "running":
+                    return False
+                now = _utcnow()
+                for entry in entries:
+                    sources = entry["sources"]
+                    if "merge_item_id" in entry:
+                        self._merge_sources(entry["merge_item_id"], sources, batch_id, now)
+                        continue
+                    item = entry["item"]
+                    previous = self._find_same_item(item, sources)
+                    if previous is None:
+                        self._insert_item(item, sources, batch_id, now)
+                    else:
+                        self._merge_sources(previous, sources, batch_id, now)
+                self._conn.execute(
+                    "UPDATE extraction_batches SET state='succeeded', lease_until='' WHERE batch_id = ?",
+                    (batch_id,),
+                )
+                return True
+        except sqlite3.Error as e:
+            raise StorageError(f"保存批次失败: {e}") from e
+
+    def _find_same_item(self, item: dict, sources: list[str]) -> str | None:
+        """同标题、类别和适用时间，还须有同一消息或一致的转发原文。"""
+        keys = set(sources)
+        source_texts = {
+            _identity_text(row["text"]) for row in self._conn.execute(
+                "SELECT text FROM messages WHERE message_key IN (SELECT value FROM json_each(?))",
+                (json.dumps(sources),),
+            )
+        }
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        candidates = self._conn.execute(
+            "SELECT item_id,title,due_at,due_date,event_at FROM items "
+            "WHERE category = ? AND (status IN ('active','needs_review') "
+            "OR (status = 'done' AND updated_at >= ?)) "
+            "ORDER BY status = 'done' DESC, rowid",
+            (item["category"], cutoff),
+        )
+        occurrence = _occurrence(item)
+        title = _identity_text(item["title"])
+        for row in candidates:
+            if title != _identity_text(row["title"]) or occurrence != _occurrence(row):
+                continue
+            for source in self._conn.execute(
+                "SELECT s.message_key, m.text FROM item_sources s JOIN messages m "
+                "ON m.message_key = s.message_key WHERE s.item_id = ?",
+                (row["item_id"],),
+            ):
+                if source["message_key"] in keys:
+                    return row["item_id"]
+                text = _identity_text(source["text"])
+                if any(occurrence) and len(text) >= 16 and text in source_texts:
+                    return row["item_id"]
+        return None
 
     # ---- 合并去重（T04） ----
 
@@ -375,37 +446,47 @@ class Storage:
         return row[0] + 1
 
     def merge_into_item(self, item_id: str, sources: list[str], batch_id: str) -> bool:
-        """把新来源挂到已有事项并记一条 revision。item 不存在返回 False。"""
-        now = _utcnow()
+        """挂接新来源，重复送达同一来源不增加版本。"""
         try:
             with self._lock, self._conn:
-                cur = self._conn.execute(
-                    "SELECT * FROM items WHERE item_id = ? AND status = 'active'", (item_id,)
-                )
-                row = cur.fetchone()
-                if row is None:
-                    return False
-                for mk in sources:
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO item_sources (item_id, message_key, relation) "
-                        "VALUES (?, ?, 'original')",
-                        (item_id, mk),
-                    )
-                rev = self._next_revision(item_id)
-                snapshot = dict(row)
-                self._conn.execute(
-                    "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (item_id, rev, json.dumps(snapshot, ensure_ascii=False),
-                     f"合并批次 {batch_id} 来源", now),
-                )
-                self._conn.execute(
-                    "UPDATE items SET revision = ?, updated_at = ? WHERE item_id = ?",
-                    (rev, now, item_id)
-                )
-                return True
+                return self._merge_sources(item_id, sources, batch_id, _utcnow())
         except sqlite3.Error as e:
             raise StorageError(f"事项合并失败: {e}") from e
+
+    def _merge_sources(self, item_id: str, sources: list[str], batch_id: str, now: str) -> bool:
+        row = self._conn.execute(
+            "SELECT * FROM items WHERE item_id = ? AND status IN ('active','needs_review','done')",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        added = 0
+        for key in sources:
+            added += self._conn.execute(
+                "INSERT OR IGNORE INTO item_sources (item_id, message_key, relation) "
+                "VALUES (?, ?, 'original')", (item_id, key)
+            ).rowcount
+        if added:
+            self._record_item_revision(row, row["status"], f"合并批次 {batch_id} 来源", now)
+        return True
+
+    def _record_item_revision(self, row, status: str, reason: str, now: str,
+                              operation_id: str | None = None) -> int:
+        item_id = row["item_id"]
+        revision = max(row["revision"] + 1, self._next_revision(item_id))
+        snapshot = {**dict(row), "status": status, "revision": revision}
+        if operation_id is not None:
+            snapshot["todo_operation_id"] = operation_id
+        self._conn.execute(
+            "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (item_id, revision, json.dumps(snapshot, ensure_ascii=False), reason, now),
+        )
+        self._conn.execute(
+            "UPDATE items SET status = ?, revision = ?, updated_at = ? WHERE item_id = ?",
+            (status, revision, now, item_id),
+        )
+        return revision
 
     def absorb_item(self, keep_id: str, drop_id: str) -> bool:
         """事项级合并：drop 的来源全部转给 keep，drop 置为 withdrawn。两者都在才执行。"""
@@ -414,13 +495,18 @@ class Storage:
         try:
             with self._lock, self._conn:
                 keep = self._conn.execute(
-                    "SELECT status FROM items WHERE item_id = ?", (keep_id,)
+                    "SELECT * FROM items WHERE item_id = ?", (keep_id,)
                 ).fetchone()
                 drop = self._conn.execute(
-                    "SELECT status FROM items WHERE item_id = ?", (drop_id,)
+                    "SELECT * FROM items WHERE item_id = ?", (drop_id,)
                 ).fetchone()
-                if keep is None or drop is None or drop["status"] == "withdrawn":
+                if keep is None or drop is None or "withdrawn" in (keep["status"], drop["status"]):
                     return False
+                if any(a and b and a != b for a, b in zip(_occurrence(keep), _occurrence(drop))):
+                    return False
+                if drop["status"] == "done" and keep["status"] != "done":
+                    keep, drop = drop, keep
+                    keep_id, drop_id = drop_id, keep_id
                 rows = self._conn.execute(
                     "SELECT message_key, relation FROM item_sources WHERE item_id = ?",
                     (drop_id,),
@@ -435,21 +521,8 @@ class Storage:
                     "DELETE FROM item_sources WHERE item_id = ?", (drop_id,)
                 )
                 now = _utcnow()
-                self._conn.execute(
-                    "UPDATE items SET revision = revision + 1, updated_at = ? "
-                    "WHERE item_id = ?",
-                    (now, keep_id),
-                )
-                self._conn.execute(
-                    "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
-                    "SELECT item_id, revision, json_object('absorbed', ?), ?, ? FROM items "
-                    "WHERE item_id = ?",
-                    (drop_id, f"并入重复事项 {drop_id}", now, keep_id),
-                )
-                self._conn.execute(
-                    "UPDATE items SET status = 'withdrawn', updated_at = ? WHERE item_id = ?",
-                    (now, drop_id),
-                )
+                self._record_item_revision(keep, keep["status"], f"并入重复事项 {drop_id}", now)
+                self._record_item_revision(drop, "withdrawn", f"合并到事项 {keep_id}", now)
                 return True
         except sqlite3.Error:
             return False
@@ -467,25 +540,43 @@ class Storage:
                 row = cur.fetchone()
                 if row is None:
                     return False
-                self._conn.execute(
-                    "UPDATE items SET status = ?, updated_at = ? WHERE item_id = ?",
-                    (status, now, item_id)
-                )
-                rev = self._next_revision(item_id)
-                snapshot = dict(row)
-                snapshot["status"] = status
-                self._conn.execute(
-                    "INSERT INTO item_revisions (item_id, revision, snapshot, reason, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (item_id, rev, json.dumps(snapshot, ensure_ascii=False), reason, now),
-                )
-                self._conn.execute(
-                    "UPDATE items SET revision = ?, updated_at = ? WHERE item_id = ?",
-                    (rev, now, item_id)
-                )
+                self._record_item_revision(row, status, reason, now)
                 return True
         except sqlite3.Error as e:
             raise StorageError(f"状态更新失败: {e}") from e
+
+    def set_todo_status(self, item_id: str, status: str, expected_revision: int | None,
+                        operation_id: str | None = None) -> tuple[int, dict]:
+        """在一次事务内做版本检查和回写。重复送达已生效的目标保持版本不变。"""
+        try:
+            with self._lock, self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT * FROM items WHERE item_id = ?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    return 404, {"error": "not found"}
+                revision = row["revision"]
+                if operation_id is not None:
+                    prior = self._conn.execute(
+                        "SELECT revision FROM item_revisions WHERE item_id = ? "
+                        "AND json_extract(snapshot, '$.todo_operation_id') = ?",
+                        (item_id, operation_id),
+                    ).fetchone()
+                    if prior is not None:
+                        return 200, {"ok": True, "task_id": item_id, "version": prior["revision"]}
+                if row["status"] == "withdrawn" and status != "withdrawn":
+                    return 409, {"error": "item withdrawn", "current_revision": revision}
+                if row["status"] != status or operation_id is not None:
+                    if expected_revision is not None and expected_revision != revision:
+                        return 412, {"error": "version conflict", "current_revision": revision}
+                    # A new intent fences delayed older writes even when the status already matches.
+                    revision = self._record_item_revision(
+                        row, status, "Todo API 回写", _utcnow(), operation_id
+                    )
+                return 200, {"ok": True, "task_id": item_id, "version": revision}
+        except sqlite3.Error as e:
+            raise StorageError(f"状态回写失败: {e}") from e
 
     # ---- Todo API（T09） ----
 

@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 
 from .ai import ExternalAI, load_image_b64, parse_json_object
-from .storage import Storage
+from .storage import Storage, StorageError
 
 logger = logging.getLogger("campus_inbox.extract")
 
@@ -194,20 +194,15 @@ def run_extraction_cycle(
 
     items = validate_items(obj, message_keys, active_map)
     new_items = [e for e in items if "merge_item_id" not in e]
-    merges = [e for e in items if "merge_item_id" in e]
-    if items:
-        try:
-            if new_items:
-                storage.insert_items(new_items, batch_id)
-            for e in merges:
-                storage.merge_into_item(e["merge_item_id"], e["sources"], batch_id)
-        except Exception:
-            storage.fail_batch(batch_id)
-            return "failed"
-    storage.finish_batch(batch_id)
-    if new_items:  # 同批次/相邻批次的重复事项：追加一次轻量去重
+    try:
+        committed = storage.commit_extraction(batch_id, items)
+    except StorageError:
+        storage.fail_batch(batch_id)
+        return "failed"
+    if committed and new_items:
         run_dedup(storage, ai)
     return "succeeded"
+
 
 
 _DEDUP_PROMPT = Path(__file__).parent.parent / "prompts" / "dedup.txt"

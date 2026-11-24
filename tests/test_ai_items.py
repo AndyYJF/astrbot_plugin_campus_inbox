@@ -296,6 +296,33 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(len(detail["revisions"]), 2)
         self.assertIn("合并", detail["revisions"][1]["reason"])
 
+    def test_completed_notice_replay_preserves_id_and_separate_occurrences(self):
+        text = "奔跑川大活动报名通知，请在本轮报名截止前提交登记表"
+        keys = [add_message(self.storage, text, f"replay-{i}") for i in range(3)]
+        def entries(key, due, extra=False):
+            notices = [{"title": "奔跑川大活动报名", "category": "registration",
+                        "due_date": due, "source_refs": ["M1"]}]
+            if extra:
+                notices.append({"title": "赛后提交证明", "category": "registration",
+                                "due_date": due, "source_refs": ["M1"]})
+            return validate_items({"items": notices}, [key])
+
+        self.storage.create_batch("original", [keys[0]], "m", PROMPT_VERSION)
+        original = entries(keys[0], "2026-11-17")
+        self.assertTrue(self.storage.commit_extraction("original", original))
+        item_id = original[0]["item"]["item_id"]
+        self.storage.set_item_status(item_id, "done")
+
+        self.storage.create_batch("forward", [keys[1]], "m", PROMPT_VERSION)
+        self.assertTrue(self.storage.commit_extraction("forward", entries(keys[1], "2026-11-17", True)))
+        self.assertFalse(self.storage.commit_extraction("forward", entries(keys[1], "2026-11-17", True)))
+        self.storage.create_batch("new-round", [keys[2]], "m", PROMPT_VERSION)
+        self.assertTrue(self.storage.commit_extraction("new-round", entries(keys[2], "2026-12-17")))
+        self.assertEqual(self.storage.list_items()[1], 3)
+        original = self.storage.get_item_detail(item_id)
+        self.assertEqual((original["status"], original["revision"]), ("done", 3))
+        self.assertEqual(len(original["sources"]), 2)
+
     def test_merge_into_missing_item_returns_false(self):
         self.assertFalse(self.storage.merge_into_item("nope", ["k"], "b1"))
 
@@ -351,7 +378,8 @@ class TestDedup(unittest.TestCase):
         detail = self.storage.get_item_detail(keep)
         self.assertEqual(len(detail["sources"]), 2)
         self.assertEqual(detail["revision"], 2)
-        self.assertEqual(self.storage.get_item_detail(drop)["status"], "withdrawn")
+        dropped = self.storage.get_item_detail(drop)
+        self.assertEqual((dropped["status"], dropped["revision"]), ("withdrawn", 2))
         # 重复合并幂等
         self.assertFalse(self.storage.absorb_item(keep, drop))
 

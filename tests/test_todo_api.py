@@ -81,6 +81,17 @@ class TodoApiTest(unittest.TestCase):
         self.assertNotIn("9000001", blob)
         self.assertNotIn("1000001", blob)
 
+    def test_new_intent_fences_a_delayed_older_write_and_replays_idempotently(self):
+        path = f"/api/todo/v1/tasks/{self.item_id}/status"
+        newer = {"status": "open", "version": 1, "operationId": "latest-intent"}
+        code, first = self._post(path, newer)
+        self.assertEqual((code, first["version"]), (200, 2))
+        code, conflict = self._post(path, {
+            "status": "completed", "version": 1, "operationId": "old-intent",
+        })
+        self.assertEqual((code, conflict["current_revision"]), (412, 2))
+        self.assertEqual(self._post(path, newer), (200, first))
+
     def test_status_filter(self):
         self.assertEqual(len(self._get("/api/todo/v1/tasks?status=completed")["tasks"]), 0)
         self.storage.set_item_status(self.item_id, "done", "测试")
